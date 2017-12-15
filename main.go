@@ -1,78 +1,357 @@
 package main
 
 import (
-	//"fmt"
+	"fmt"
 	"time"
+	"sort"
+	"strconv"
 )
 //用农作物替代币
 //价格以1斤大米的价格为单位
-const (
-	DAMI = iota
-	YUMI
-	TUDOU
-	DIGUA
-	HUASHENG
-	GAOLIANG
-)
 
-type Order struct {
-	User string            //用户名称
+const ZERO float64 = 0.000001       //精度还可以更小
+var GoodsLock sync.RWMutex
+var UserLock sync.RWMutex
+
+//用户信息，有一个用户手中商品的数量
+type User struct {
+	UserId int
+	Money  float64
+	HuaShengCount float64    //以其为标准
+	DaMiCount float64
+	YUMICount float64
+
+}
+var UserList = make(UserS,0,100)
+type Basic struct {
+	UserId int             //用户名称
 	Price float64          //可以接受的价格
 	Count float64          //货物数量
+}
+type Order struct {
+	Basic
 	CTime int64            //上架时间，先使用秒为单位
 }
-var BuyerList =make([]Order,0,200)
-var SellerList =make([]Order,0,200)
+type OrderS []Order 
+type UserS []User 
+type TradeBar struct {
+	 Name string          //商品名称
+	 buy  OrderS
+	 sell OrderS
+	 StrikePrice float64    //当前商品撮合交易价
+}
+var YuMiT TradeBar
+var UserID int
+var MaxID int = 10000
+//应该是升序排列,价格从底到高
+func (o OrderS) Len() int {
+	return len(o)
+}
+func (o OrderS) Swap(i,j int) {
+	o[i],o[j] = o[j],o[i]
+}
+func (o OrderS) Less(i,j int) bool {
+	return  o[i].Price < o[j].Price
+}
 
 //将买家需要的货物信息插入买入链表中
-func AddBuyer(goods *Order) {
+func (t *TradeBar)AddBuyer(basic *Basic) {
 	//time.Now().UnixNano()
-	goods.CTime= time.Now().Unix()   // //以后可能会使用纳妙
-	BuyerList = append(BuyerList,*goods)
+	goods := Order{*basic,time.Now().Unix()}   //以后可能会使用纳妙
+	t.buy = append(t.buy,goods)
+
+	sort.Sort(t.buy)
+	l := len(t.buy)
+	if l <= 1 {
+		t.PrintDeal()
+		return
+	} 
+	for i:=0;i<l-1;i++ {
+		if t.buy[i+1].Price == t.buy[i].Price {
+			if t.buy[i+1].CTime < t.buy[i].CTime {  //换一下位置
+				t.buy[i+1],t.buy[i] = t.buy[i],t.buy[i]
+				i=0  //重新遍历,直到排序完成
+			}
+		}
+	} 
+	t.PrintDeal()
 }
 //将卖家需要卖出的货物信息插入出售链表中
-func AddSeller(goods *Order) {
+func (t *TradeBar)AddSeller(basic *Basic) {
 	//time.Now().UnixNano()
-	goods.CTime= time.Now().Unix()   // //以后可能会使用纳妙
-	SellerList = append(SellerList,*goods)
+	goods := Order{*basic,time.Now().Unix()}   //以后可能会使用纳妙
+
+	t.sell = append(t.sell,goods)
+	sort.Sort(t.sell)                  //根据价格进行排序
+	//同价格根据插入时间进行排序
+	l := len(t.sell)
+	if l <= 1 {
+		t.PrintDeal()
+		return
+	} 
+	for i:=0;i<l-1;i++ {
+		if t.sell[i+1].Price == t.sell[i].Price {
+			if t.sell[i+1].CTime < t.sell[i].CTime {  //换一下位置
+				t.sell[i+1],t.sell[i] = t.sell[i],t.sell[i]
+				i=0  //重新遍历,直到排序完成
+			}
+		}
+	} 
+	t.PrintDeal()
 }
+
+//核心函数，进行撮合(以后需要多线程进行撮合，提高性能)
+//撮合原则:1.价格优先，优先匹配出价最高买方和出价最低卖方
+//        2.同价格，时间优先
+
+func (t *TradeBar)Match() {
+	fmt.Println("start-->")
+	for {
+		if len(t.buy)== 0 || len(t.sell) == 0 {
+			time.Sleep(1*time.Second)
+			continue
+		}
+		if t.buy[0].Price >= t.sell[0].Price {    //只撮合最头上的一笔交易，撮合完成，继续循环
+				fmt.Println("可以进行交易")
+				t.Deal(0,0)  	
+				continue
+					 //交易完成，slice改变，从头再次撮合，还是先撮合买家价格高，卖家价格低的//因为是从低到高排序，所以如果买方出价低于卖方价格，那么就不需要继续匹配了
+		} 
+		time.Sleep(1*time.Second)
+	}
+}
+//先交易卖方价格最低的，不够的话，继续交易其他的
+func (t *TradeBar)Deal(i,j int) bool {  
+	buyer := GetUser(t.buy[i].UserId)            
+	seller := GetUser(t.sell[j].UserId)
+	if buyer == nil || seller == nil {
+		fmt.Println("buyer == nil || seller == nil")
+		return false
+	}
+	//确定交易数量
+	var count float64 
+	flag := 0
+	//需要加锁，多线程
+	if t.buy[i].Count >= t.sell[j].Count {
+		flag = 0
+		count = t.sell[j].Count
+	} else {
+		flag = 1
+		count = t.buy[i].Count
+	}
+	money := count * t.sell[j].Price
+	if buyer.Money < money {
+		fmt.Println("buyer.Money < money")
+		return false 
+	}
+	buyer.Money -= money
+	t.buy[i].Count += count
+	seller.Money += money
+	t.sell[j].Count -= count
+	//如果前一笔成交价低于或等于卖出价，则最新成交价就是卖出价
+	//如果前一笔成交价高于或等于买入价，则最新成交价就是买入价
+	//如果前一笔成交价在卖出价与买入价之间，则最新成交价就是前一笔的成交价
+
+	if t.StrikePrice <= t.sell[j].Price {
+		t.StrikePrice = t.sell[j].Price
+	}else if t.StrikePrice > t.buy[i].Price {
+		t.StrikePrice = t.buy[i].Price
+	}
+	fmt.Printf("撮合成功 买家%d 卖家:%d 交易数量:%f 撮合交易价格:%f\n",t.buy[i].UserId,t.sell[j].UserId,count,t.StrikePrice)
+	//虽有操作完成之后，最后才能删除操作
+	if flag == 1 {           //买方买足产品
+		t.buy = append(t.buy[:i], t.buy[i+1:]...) 
+	} else if flag == 0 {   //卖方卖完产品
+		t.sell = append(t.sell[:j], t.sell[j+1:]...) 
+	}
+	//如果成交价在卖出价和买入价之间，最新成交价不变，参考百度百科-->撮合成交价
+	return true
+}
+
+func GetUser(userId int) *User {
+	for _,user := range UserList {
+		if user.UserId == userId {
+			return &user
+		}
+	}
+	return nil
+}
+
+func Login () {
+	idStr := ""
+	for {
+		fmt.Println("请输入用户ID，10000到10006")
+		fmt.Scanln(&idStr)
+		id,err := strconv.Atoi(idStr)
+		if err != nil || id > 10006 || id < 10000 {
+			fmt.Println("用户ID不正确，请重新输入:")
+			continue
+		}
+		UserID = id
+		fmt.Println("------登陆成功-------")
+		return
+	}
+}
+func Register() {
+	u := User{}
+	MaxID++
+	u.UserId =MaxID 
+	UserID=MaxID
+	u.Money= 999999
+	u.YUMICount=9999
+
+	UserLock.Lock()
+	UserList=append(UserList,u)
+	UserLock.Unlock()
+	fmt.Println("注册成功 ID-->",UserID)
+}
+
+func menu() {
+	choose := 0
+	var price float64
+	var count float64 
+	for {
+		fmt.Println("1. 注册用户")
+		fmt.Println("2. 用户登陆或重新登陆")
+		fmt.Println("3. 查看当前玉米买卖信息")
+		fmt.Println("4. 上架卖出玉米")
+		fmt.Println("5. 上架买入玉米")
+		fmt.Println("6. 查看资产信息")
+		fmt.Scanln(&choose)
+		switch choose {
+		case 1:
+			Register()
+		case 2:
+			Login()
+		case 3:
+			YuMiT.PrintDeal()
+		case 4:
+			fmt.Println("请输入需要上架卖出玉米的单价")
+			fmt.Scanln(&price)
+			fmt.Println("请输入需要上架卖出玉米的数量")
+			fmt.Scanln(&count)
+			b :=Basic{UserID,price,count}
+			YuMiT.AddSeller(&b)
+			fmt.Println("卖出上架成功")
+		case 5:
+			fmt.Println("请输入需要上架买入玉米的单价")
+			fmt.Scanln(&price)
+			fmt.Println("请输入需要上架买入玉米的数量")
+			fmt.Scanln(&count)
+			b :=Basic{UserID,price,count}
+			YuMiT.AddBuyer(&b)
+			fmt.Println("买入上架成功")
+		case 6:
+			UserLock.RLock
+			for _,m := range UserList {
+				if UserID == m.UserId {
+					fmt.Println("用户信息:")
+					fmt.Println(m)
+					break
+				}
+			}
+			UserLock.RUnlock
+		default:
+		}
+	}
+}
+
+func (t TradeBar) PrintDeal() {
+	fmt.Println("需购买货物信息:")
+	for _,b := range t.buy {
+		fmt.Println("用户ID：",b.UserId," 需购买价格:",b.Price," 需购买数量: ",b.Count," 上架时间",b.CTime)
+	}
+	fmt.Println("待出售货物信息:")
+	for _,s := range t.sell {
+		fmt.Println("用户ID：",s.UserId," 待出售价格:",s.Price," 待出售数量: ",s.Count," 上架时间",s.CTime)
+	}
+
+}
+
+
 func main() {
-	tuDou0 := Order{"土豆",2.3,90,0} 	//1斤土豆等于2.3斤大米
+	YuMiT = TradeBar{}
+	YuMiT.Name = "玉米"
+	YuMiT.buy = make(OrderS,0,200)
+	YuMiT.sell = make(OrderS,0,200)
+	go YuMiT.Match()
+	menu()
+
+	/*
+	user1 := User{10001,10320.65,540.5,721.4,823.9} 
+	user2 := User{10002,20723.44,721.2,381.94,331.8}
+	user3 := User{10002,20723.44,371.7,381.94,331.8}
+	user4 := User{10002,207：买家出价高的优先，卖家出价低的优先，如果出价相同则挂单时间最早的优先。
+23.44,271.3,381.94,331.8}
+	user5 := User{10002,20723.44,871.2,381.94,331.8}
+	user6 := User{10002,20723.44,571.9,381.94,331.8}
+	UserList = append(UserList,user1)
+	UserList = append(UserList,user2)
+	UserList = append(UserList,user3)
+	UserList = append(UserList,user4)
+	UserList = append(UserList,user5)
+	UserList = append(UserList,user6)
+
+
+	yuMi0 := Order{Basic{10001,2.7,45},time.Now().Unix()} 
+	YuMiT.buy = append(YuMiT.buy,yuMi0)
+	time.Sleep(1)
+
+	yuMi1 := Order{Basic{10002,2.6,32},time.Now().Unix()} 
+	YuMiT.buy = append(YuMiT.buy,yuMi1)
+	time.Sleep(1)
+
+	yuMi2 := Order{Basic{10003,2.68,65},time.Now().Unix()} 
+	YuMiT.buy = append(YuMiT.buy,yuMi2)
+
+	yuMi3 := Order{Basic{10004,2.5,64},time.Now().Unix()} 
+	YuMiT.sell = append(YuMiT.sell,yuMi3)
+	time.Sleep(1)
+
+	yuMi4 := Order{Basic{10005,2.4,122},time.Now().Unix()} 
+	YuMiT.sell = append(YuMiT.sell,yuMi4)
+	time.Sleep(1)
+
+	yuMi5 := Order{Basic{10006,2.8,112},time.Now().Unix()} 
+	YuMiT.sell = append(YuMiT.sell,yuMi5)
+	time.Sleep(1)
+	menu()
+	*/
+
+}
+/*
+
+	tuDou0 := Order{10000,"土豆",2.3,90,0} 	//1斤土豆等于2.3斤大米
 	AddSeller(&tuDou0)
 	time.Sleep(1)
-	tuDou1 := Order{"土豆",2.32,73,0}
+	tuDou1 := Order{10000,"土豆",2.32,73,0}
 	AddSeller(&tuDou1)
 	 
 	time.Sleep(1)
-	tuDou2 := Order{"土豆",2.41,102,0}
+	tuDou2 := Order{10000,"土豆",2.41,102,0}
 	AddSeller(&tuDou2)
  
-	yuMi0 := Order{"玉米",2.7,45,0} 
-	AddSeller(&yuMi0)
-	time.Sleep(1)
-	yuMi1 := Order{"玉米",2.6,32,0} 
-	AddSeller(&yuMi1)
-	time.Sleep(1)
-	yuMi2 := Order{"玉米",2.68,65,0} 
-	AddSeller(&yuMi2)
+	
 
-	huaSheng0 := Order{"花生",4.6,21,0}
+	huaSheng0 := Order{10000,"花生",4.6,21,0}
 	AddSeller(&huaSheng0)
 	time.Sleep(1)
-	huaSheng1 := Order{"花生",4.65,64,0}
+	huaSheng1 := Order{10000,"花生",4.65,64,0}
 	AddSeller(&huaSheng1)
 	time.Sleep(1)
-	huaSheng2 := Order{"花生",4.727,6,0}
+	huaSheng2 := Order{10000,"花生",4.727,6,0}
 	AddSeller(&huaSheng2)
+              
 
-
-	diGua0 := Order{"地瓜",1.4,54,0}
+	diGua0 := Order{10000,"地瓜",1.4,54,0}
 	AddSeller(&diGua0)
 	time.Sleep(1)
-	diGua1 := Order{"地瓜",1.28,87,0}
+	diGua1 := Order{10000,"地瓜",1.28,87,0}
 	AddSeller(&diGua1)
 	time.Sleep(1)
-	diGua2 := Order{"地瓜",1.32,29,0}
+	diGua2 := Order{10000,"地瓜",1.32,29,0}
 	AddSeller(&diGua2)
+	fmt.Println(BuyerList)
+	fmt.Println(SellerList)
+*/
 
-}
